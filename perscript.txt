@@ -1,0 +1,12 @@
+perl -i -0777 -pe '
+  s/\r//g;
+  s/^\h*(Add note|About archived jobs|Archived|0? ?notifications|unarchived|In Progress.*|Notes|otes|•.*|Previous|Interview.*|Date posted|Applied ·.*|Saved.*|Next|Did you hear back\?|YesNo|Not seeing some jobs\?)\h*(?:\n|$)//gmi;
+  s/^\h*\n//gm;
+  s/((?:applications|Posted.*?ago|Reposted.*?ago)\)?)\h*(?:\n|$)(?!\h*(?:Application viewed|Resume downloaded))/$1\n\n/gi;
+  s/^\h*(Application viewed|Resume downloaded)\h*(?:\n|$)/$1\n\n/gmi;
+  s/\h*·\h*/ | /g;
+  s/\n{2,}/__JOB_BREAK__/g;
+  s/\n/ | /g;
+  s/__JOB_BREAK__/\n/g;
+  s/(?: \| )+$//;
+' linkedindump.txt

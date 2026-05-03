@@ -154,8 +154,13 @@ nonfunctionapps/
 
 local.settings.json
 
-perscript.txt
+!perscript.txt
 !function_app.py
 !clean_email_raw.py
 !bulk_upload.py
+!fetch_all.py
+!linkedin_parser.py
+!local_sync.py
+!requirements.txt
+!local_load.py
 .DS_Store
