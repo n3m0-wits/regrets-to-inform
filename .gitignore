@@ -146,7 +146,7 @@ testjson.json
 
 *.py
 *.ipynb
-nonfunctionapps/
+
 *.txt
 *.mime 
 *.csv
@@ -163,4 +163,9 @@ local.settings.json
 !local_sync.py
 !requirements.txt
 !local_load.py
+!/nonfunctionapps/wrangling_notebook.ipynb
+nonfunctionapps/unprocessed_email_dump/*
+nonfunctionapps/email_dump/*
+nonfunctionapps/email_dump/processed/*
+nonfunctionapps/email_dump/unprocessed/*
 .DS_Store
