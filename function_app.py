@@ -229,3 +229,90 @@ def clean_html_to_text(html_content):
     text = re.sub(r'\n\s*\n+', '\n\n', text)
     return text.strip()
 
+
+@app.timer_trigger(schedule="0 0 0 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
+def clean_emails_daily(myTimer: func.TimerRequest) -> None:
+    if myTimer.past_due:
+        logging.info('The timer is past due!')
+
+    logging.info('Python timer trigger function started parsing emails.')
+
+    conn_str = os.environ.get("deepstatedatabase_STORAGE")
+    if not conn_str:
+        logging.error("Missing 'deepstatedatabase_STORAGE' connection string in environment.")
+        return
+
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+
+        input_container_client = blob_service_client.get_container_client("rawdumps")
+        output_container_client = blob_service_client.get_container_client("cleanmail")
+
+        blobs = input_container_client.list_blobs(name_starts_with="unprocessed/")
+
+        processed_count = 0
+        for blob in blobs:
+            if blob.name.endswith('/'):
+                continue
+
+            logging.info(f"Processing blob: {blob.name}")
+            blob_client = input_container_client.get_blob_client(blob)
+
+            try:
+                contents = blob_client.download_blob().readall().decode('utf-8', errors='ignore')
+                json_payload = json.loads(contents)
+
+                subject = json_payload.get('Subject', '')
+                if subject:
+                    subject = decode_unicode_escapes(str(subject))
+                    subject = re.sub(r'[—\-]{3,}', '', subject)
+                    subject = nuke_invisible_whitespace(subject)
+
+                body_text = json_payload.get('Body', '')
+                if body_text:
+                    body_text = remove_long_urls(clean_html_to_text(body_text))
+                    body_text = re.sub(r'[—\-]{3,}', ' ', body_text)
+
+                email_data = {
+                    "filename": blob.name.split('/')[-1],
+                    "to": json_payload.get('To', ''),
+                    "from": json_payload.get('From', ''),
+                    "subject": subject,
+                    "cc": json_payload.get('Cc', ''),
+                    "date": json_payload.get('DateTimeReceived', ''),
+                    "body": body_text
+                }
+
+                original_filename = blob.name.split('/')[-1]
+
+                sender_raw = str(json_payload.get('From', 'unknown')).strip()
+                sender_safe = re.sub(r'[^a-zA-Z0-9]', '_', sender_raw)[:40]
+
+                date_str = str(json_payload.get('DateTimeReceived', ''))
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(date_str)
+                    time_prefix = str(int(dt.timestamp() * 1000))
+                except Exception:
+                    time_prefix = str(int(time.time() * 1000))
+
+                new_base_name = f"{time_prefix}_{sender_safe}" if sender_safe else time_prefix
+                output_blob_name = f"unprocessed/{new_base_name}.json"
+
+                output_blob_client = output_container_client.get_blob_client(output_blob_name)
+                output_blob_client.upload_blob(json.dumps(email_data, indent=4), overwrite=True)
+
+                processed_blob_client = input_container_client.get_blob_client(f"processed/{original_filename}")
+                processed_blob_client.start_copy_from_url(blob_client.url)
+
+                blob_client.delete_blob()
+
+                processed_count += 1
+            except Exception as inner_e:
+                logging.error(f"Error parsing blob {blob.name}: {inner_e}")
+                continue
+
+        logging.info(f"Python timer trigger successfully finished. Processed {processed_count} emails.")
+
+    except Exception as e:
+        logging.error(f"Fatual error connecting to blob storage or iterating: {e}")
