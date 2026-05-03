@@ -1,0 +1,15 @@
+.git*
+.vscode
+__azurite_db*__.json
+__blobstorage__
+__queuestorage__
+local.settings.json
+test
+.mime
+
+mime_raw_files/
+Linkedin_data/
+raw_example.txt
+testjson.json
+output_files/
+__pycache__/

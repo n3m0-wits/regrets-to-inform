@@ -144,6 +144,18 @@ Linkedin_data/
 raw_example.txt
 testjson.json
 
-.py
-.ipynb
+*.py
+*.ipynb
 nonfunctionapps/
+*.txt
+*.mime 
+*.csv
+*.env
+
+local.settings.json
+
+perscript.txt
+!function_app.py
+!clean_email_raw.py
+!bulk_upload.py
+.DS_Store
