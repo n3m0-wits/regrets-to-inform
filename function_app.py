@@ -481,3 +481,368 @@ def analyze_emails_daily(myTimer: func.TimerRequest) -> None:
     except Exception as e:
         logging.error(f"Fatal error during analysis job: {e}")
 
+
+
+def _build_flat_doc(
+    job_slug: str,
+    company_name: str,
+    job_title: str,
+    app_date: datetime,
+    record_type: str,
+    email_msg: Optional[EmailMessage] = None,
+    linkedin: Optional[LinkedInJob] = None,
+    master_doc: Optional[Dict] = None,
+) -> Dict:
+    """Build a fully flat CosmosDB document. Pulled out of the trigger for testability."""
+
+    def _make_email_id(slug: str, filename: str) -> str:
+        return f"{slug}_{hashlib.md5(filename.encode()).hexdigest()[:8]}"
+
+    def _extract_linkedin_fields(raw_data: Dict) -> Dict:
+        if not raw_data:
+            return {}
+        flat = {}
+        for k, v in raw_data.items():
+            if k in ("Application_Date", "Company_Name", "Job_Title", "Job_Url"):
+                continue
+            key = f"linkedin_{re.sub(r'[^a-zA-Z0-9_]', '_', k).lower()}"
+            flat[key] = v
+        return flat
+
+    doc: Dict[str, Any] = {
+        "id": "",
+        "type": "job_application",
+        "job_id": job_slug,
+        "partitionKey": TextNormalizer.company(company_name)[:20] or "unknown",
+        "record_type": record_type,
+        "company_name": company_name,
+        "company_normalized": TextNormalizer.company(company_name),
+        "job_title": job_title,
+        "job_title_normalized": TextNormalizer.title(job_title),
+        "application_date": app_date.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if email_msg:
+        doc["id"] = _make_email_id(job_slug, email_msg.filename)
+        doc["email_filename"] = email_msg.filename
+        doc["email_date"] = email_msg.date.isoformat()
+        doc["email_to"] = email_msg.to or None
+        doc["email_from"] = email_msg.from_address or None
+        doc["email_subject"] = email_msg.subject or None
+        doc["email_body_preview"] = email_msg.body[:600] if email_msg.body else None
+    else:
+        doc["id"] = f"{job_slug}_linkedin"
+        doc["email_filename"] = None
+        doc["email_date"] = None
+        doc["email_to"] = None
+        doc["email_from"] = None
+        doc["email_subject"] = None
+        doc["email_body_preview"] = None
+
+    a = email_msg.analysis if email_msg else {}
+    doc["analysis_company_applied_for"]      = _clean_str(a.get("company_applied_for"))
+    doc["analysis_portal"]                   = _clean_str(a.get("portal"))
+    doc["analysis_type"]                     = _clean_str(a.get("type"))
+    doc["analysis_role"]                     = _clean_str(a.get("role"))
+    doc["analysis_category"]                 = _clean_str(a.get("category"))
+    doc["analysis_is_automated"]             = _clean_bool(a.get("is_automated"))
+    doc["analysis_urgency"]                  = _clean_str(a.get("urgency"))
+    doc["analysis_interview_type"]           = _clean_str(a.get("interview_type"))
+    doc["analysis_interview_platform"]       = _clean_str(a.get("interview_platform"))
+    doc["analysis_interview_date_iso"]       = _clean_str(a.get("interview_date_iso"))
+    doc["analysis_test_platform"]            = _clean_str(a.get("test_platform"))
+    doc["analysis_test_duration_mins"]       = _clean_int(a.get("test_duration_mins"))
+    doc["analysis_application_deadline_iso"] = _clean_str(a.get("application_deadline_iso"))
+    doc["analysis_action_required"]          = _clean_bool(a.get("action_required"))
+    doc["analysis_action_type"]              = _clean_str(a.get("action_type"))
+    doc["analysis_action_deadline_iso"]      = _clean_str(a.get("action_deadline_iso"))
+    doc["analysis_work_mode"]                = _clean_str(a.get("work_mode"))
+    doc["analysis_location"]                 = _clean_str(a.get("location"))
+    doc["analysis_recruiter_name"]           = _clean_str(a.get("recruiter_name"))
+    doc["analysis_recruiter_email"]          = _clean_str(a.get("recruiter_email"))
+    doc["analysis_summary"]                  = _clean_str(a.get("summary"))
+    if linkedin:
+        doc["linkedin_job_url"] = linkedin.job_url or None
+        doc["linkedin_application_date"] = linkedin.application_date.isoformat()
+        doc["linkedin_company_name"] = linkedin.company_name or None
+        doc["linkedin_job_title"] = linkedin.job_title or None
+        doc.update(_extract_linkedin_fields(linkedin.raw_data))
+    elif master_doc:
+        doc["linkedin_job_url"] = master_doc.get("linkedin_job_url")
+        doc["linkedin_application_date"] = master_doc.get("linkedin_application_date")
+        doc["linkedin_company_name"] = master_doc.get("linkedin_company_name")
+        doc["linkedin_job_title"] = master_doc.get("linkedin_job_title")
+        for k, v in master_doc.items():
+            if k.startswith("linkedin_") and k not in doc:
+                doc[k] = v
+    else:
+        doc["linkedin_job_url"] = None
+        doc["linkedin_application_date"] = None
+        doc["linkedin_company_name"] = None
+        doc["linkedin_job_title"] = None
+
+    return doc
+
+
+def _make_slug(company: str, title: str, app_date: datetime) -> str:
+    date_part = app_date.strftime('%Y%m%d') if app_date else "unknown"
+    raw = f"{TextNormalizer.company(company)}|{TextNormalizer.title(title)}|{date_part}"
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
+def _move_blob(container_client, src_name: str, dst_name: str) -> None:
+    """Server-side copy then delete source. Mirrors the pattern in clean_emails_daily."""
+    src = container_client.get_blob_client(src_name)
+    dst = container_client.get_blob_client(dst_name)
+    dst.start_copy_from_url(src.url)
+    src.delete_blob()
+
+
+@app.timer_trigger(schedule="0 0 10 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
+def sync_to_cosmos_daily(myTimer: func.TimerRequest) -> None:
+    if myTimer.past_due:
+        logging.info('Cosmos sync timer is past due!')
+
+    logging.info('Starting CosmosDB sync job.')
+
+    conn_str = os.environ.get("deepstatedatabase_STORAGE")
+    if not conn_str:
+        logging.error("Missing 'deepstatedatabase_STORAGE' connection string.")
+        return
+
+    cosmos_endpoint = os.environ.get("COSMOS_ENDPOINT")
+    cosmos_key = os.environ.get("COSMOS_KEY")
+    if not cosmos_endpoint or not cosmos_key:
+        logging.error("Missing CosmosDB credentials.")
+        return
+
+    max_docs_per_run = int(os.environ.get("SYNC_MAX_DOCS", "7000"))
+    docs_written = 0
+
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+        cosmos = CosmosManager(
+            cosmos_endpoint,
+            cosmos_key,
+            os.environ.get("COSMOS_DATABASE", "jobtracker"),
+            os.environ.get("COSMOS_CONTAINER", "applications")
+        )
+        cosmos.init_container()
+        matcher = JobMatcher(tolerance_days=5, threshold=0.72)
+        cleanmail_client = blob_service_client.get_container_client("cleanmail")
+        email_blobs = cleanmail_client.list_blobs(name_starts_with="processed/")
+
+        email_records: List[Tuple[EmailMessage, str]] = []
+        for blob in email_blobs:
+            if not blob.name.endswith(".json"):
+                continue
+            try:
+                bc = cleanmail_client.get_blob_client(blob)
+                payload = json.loads(bc.download_blob().readall().decode('utf-8', errors='ignore'))
+                date_str = payload.get("date", "")
+                parsed_date = (
+                    normalize_to_utc(date_parser.parse(date_str))
+                    if date_str else datetime.now(timezone.utc)
+                )
+                em = EmailMessage(
+                    filename=payload.get("filename", blob.name.split("/")[-1]),
+                    to=payload.get("to", ""),
+                    from_address=payload.get("from", ""),
+                    subject=payload.get("subject", ""),
+                    date=parsed_date,
+                    body=payload.get("body", ""),
+                    analysis=payload.get("analysis", {}) or {},
+                )
+                email_records.append((em, blob.name))
+            except Exception as e:
+                logging.warning(f"Skipping email blob {blob.name}: {e}")
+
+        emails = [r[0] for r in email_records]
+        filename_to_blob: Dict[str, str] = {em.filename: src for em, src in email_records}
+        logging.info(f"Loaded {len(emails)} processed emails.")
+        
+        # Load LinkedIn CSV
+        linkedin_jobs: List[LinkedInJob] = []
+        linkedin_path = os.environ.get("LINKEDIN_BLOB_PATH", "rawdumps/linkedin/Linkedin_QuickApply.csv")
+
+        try:
+            parts = linkedin_path.split("/", 1)
+            li_container = parts[0]
+            li_blob = parts[1] if len(parts) > 1 else linkedin_path
+
+            li_blob_client = blob_service_client.get_blob_client(container=li_container, blob=li_blob)
+            csv_bytes = li_blob_client.download_blob().readall()
+            df = pd.read_csv(BytesIO(csv_bytes), index_col=0)
+            df = df.where(pd.notnull(df), None)
+
+            for _, row in df.iterrows():
+                try:
+                    d = normalize_to_utc(
+                        date_parser.parse(str(row["Application_Date"])),
+                        assume_tz=SOUTH_AFRICA_TZ
+                    )
+                except Exception:
+                    continue
+                linkedin_jobs.append(LinkedInJob(
+                    application_date=d,
+                    company_name=str(row.get("Company_Name", "")),
+                    job_title=str(row.get("Job_Title", "")),
+                    job_url=str(row.get("Job_Url", "")),
+                    raw_data=row.to_dict(),
+                ))
+            logging.info(f"Loaded {len(linkedin_jobs)} LinkedIn rows.")
+        except Exception as e:
+            logging.error(f"Could not load LinkedIn CSV from {linkedin_path}: {e}")
+            linkedin_jobs = []
+
+        # Load existing CosmosDB docs to build job masters
+        existing_docs = cosmos.fetch_all_jobs()
+        job_masters: Dict[str, Dict] = {}
+        for doc in existing_docs:
+            sid = doc.get("job_id")
+            if sid and sid not in job_masters:
+                job_masters[sid] = doc
+        logging.info(f"Loaded {len(existing_docs)} existing CosmosDB docs ({len(job_masters)} unique jobs).")
+
+        docs_to_upsert: Dict[str, Dict] = {}
+        matched_linkedin_ids: set = set()
+
+        #Match & merge emails into flat rows
+        for email_msg in emails:
+            try:
+                best_master_slug = None
+                best_master_score = 0.0
+                best_master_doc = None
+                for slug, master in job_masters.items():
+                    try:
+                        master_date = normalize_to_utc(date_parser.parse(master["application_date"]))
+                    except Exception:
+                        continue
+                    temp_job = LinkedInJob(
+                        application_date=master_date,
+                        company_name=master.get("company_name", "") or "",
+                        job_title=master.get("job_title", "") or "",
+                        job_url=master.get("linkedin_job_url", "") or "",
+                        raw_data={},
+                    )
+                    score, _ = matcher.calculate_score(email_msg, temp_job)
+                    if score >= matcher.threshold and score > best_master_score:
+                        best_master_slug = slug
+                        best_master_score = score
+                        best_master_doc = master
+
+                if best_master_slug:
+                    master_date = normalize_to_utc(date_parser.parse(best_master_doc["application_date"]))
+                    doc = _build_flat_doc(
+                        job_slug=best_master_slug,
+                        company_name=best_master_doc["company_name"],
+                        job_title=best_master_doc["job_title"],
+                        app_date=master_date,
+                        record_type="email",
+                        email_msg=email_msg,
+                        master_doc=best_master_doc,
+                    )
+                    docs_to_upsert[doc["id"]] = doc
+                    continue
+
+                result = matcher.find_best_match(email_msg, linkedin_jobs)
+                if result:
+                    li_job, score, details = result
+                    li_id = hashlib.md5(
+                        f"{li_job.company_name}|{li_job.job_title}|{li_job.application_date.isoformat()}".encode()
+                    ).hexdigest()
+                    matched_linkedin_ids.add(li_id)
+
+                    slug = _make_slug(li_job.company_name, li_job.job_title, li_job.application_date)
+                    doc = _build_flat_doc(
+                        job_slug=slug,
+                        company_name=li_job.company_name,
+                        job_title=li_job.job_title,
+                        app_date=li_job.application_date,
+                        record_type="email",
+                        email_msg=email_msg,
+                        linkedin=li_job,
+                    )
+                    docs_to_upsert[doc["id"]] = doc
+                    job_masters[slug] = doc
+                    logging.info(
+                        f"Matched email '{email_msg.filename}' -> {li_job.company_name} / {li_job.job_title} "
+                        f"(score={score:.2f}, days_diff={details['days_diff']})"
+                    )
+                    continue
+
+                slug = _make_slug(email_msg.company, email_msg.role, email_msg.date)
+                doc = _build_flat_doc(
+                    job_slug=slug,
+                    company_name=email_msg.company or "Unknown",
+                    job_title=email_msg.role or "Unknown",
+                    app_date=email_msg.date,
+                    record_type="email",
+                    email_msg=email_msg,
+                )
+                docs_to_upsert[doc["id"]] = doc
+                job_masters[slug] = doc
+                logging.info(f"Orphan email created for '{email_msg.filename}'")
+
+            except Exception as e:
+                logging.error(f"Failed processing email {email_msg.filename}: {e}")
+                continue
+
+        for job in linkedin_jobs:
+            li_id = hashlib.md5(
+                f"{job.company_name}|{job.job_title}|{job.application_date.isoformat()}".encode()
+            ).hexdigest()
+            if li_id in matched_linkedin_ids:
+                continue
+            slug = _make_slug(job.company_name, job.job_title, job.application_date)
+            if slug in job_masters:
+                continue
+            doc = _build_flat_doc(
+                job_slug=slug,
+                company_name=job.company_name,
+                job_title=job.job_title,
+                app_date=job.application_date,
+                record_type="linkedin",
+                linkedin=job,
+            )
+            docs_to_upsert[doc["id"]] = doc
+            job_masters[slug] = doc
+
+        logging.info(f"Upserting up to {len(docs_to_upsert)} flat documents to CosmosDB...")
+        synced_email_filenames: set = set()
+        hit_cap = False
+
+        for doc in docs_to_upsert.values():
+            if docs_written >= max_docs_per_run:
+                logging.warning(f"Hit safety cap of {max_docs_per_run} docs. Remaining will be picked up next run.")
+                hit_cap = True
+                break
+            try:
+                cosmos.upsert(doc)
+                docs_written += 1
+                fname = doc.get("email_filename")
+                if fname:
+                    synced_email_filenames.add(fname)
+            except Exception as e:
+                logging.error(f"Upsert failed for id={doc.get('id')}: {e}")
+
+        moved = 0
+        for fname in synced_email_filenames:
+            src_blob = filename_to_blob.get(fname)
+            if not src_blob:
+                continue
+            dst_blob = src_blob.replace("processed/", "synced/", 1)
+            try:
+                _move_blob(cleanmail_client, src_blob, dst_blob)
+                moved += 1
+            except Exception as e:
+                logging.warning(f"Could not move blob {src_blob} -> {dst_blob}: {e}")
+
+        logging.info(
+            f"CosmosDB sync done. Upserts: {docs_written}/{len(docs_to_upsert)}. "
+            f"Moved {moved} email blobs to synced/. {'(cap hit)' if hit_cap else ''}"
+        )
+
+    except Exception as e:
+        logging.error(f"Fatal error during CosmosDB sync: {e}")
