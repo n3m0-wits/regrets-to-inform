@@ -316,3 +316,168 @@ def clean_emails_daily(myTimer: func.TimerRequest) -> None:
 
     except Exception as e:
         logging.error(f"Fatual error connecting to blob storage or iterating: {e}")
+
+LLM_BATCH_CAP = 120
+
+ANALYSIS_SYSTEM_PROMPT = """You are a strict data-extraction assistant for job-related emails.
+
+Read the subject and body, then return ONE valid JSON object — no markdown, no fences, no commentary.
+
+OUTPUT RULES (non-negotiable):
+- Use JSON null for unknown values. NEVER output the string "None"; use real null.
+- Booleans: true / false / null only. No strings.
+- Integers: numbers, not strings.
+- Date fields ending in _iso: ISO 8601 with timezone if known
+  (e.g. "2026-05-03T14:00:00+02:00"). Use null if no specific date is given.
+
+SCHEMA:
+{
+  "company_applied_for":      string | null,
+  "portal":                   string | null,            // "SmartRecruiters", "LinkedIn", "Workday", "Greenhouse", "Indeed", ...
+  "type":                     "Job ad" | "Application update" | "Rejection" | "Offer" | "Unrelated" | "Unknown",
+  "role":                     string | null,            // job title, max 35 chars
+  "category":                 "Job Ad" | "Recruiter Reach-out" | "Bot/Auto-Reply" | "Confirmation of Application"
+                            | "Rejection" | "Request for Information" | "Technical Test Request"
+                            | "Personality Test Request" | "Interview Invitation" | "Job Offer"
+                            | "Not Job Related" | "Unknown",
+  "is_automated":             boolean | null,
+  "urgency":                  "High" | "Medium" | "Low",   // High if any deadline <=48h, Medium <=72h, else Low
+  "interview_type":           "Online-Live" | "In-Person" | "One-Way-Robot" | "Phone-Call" | "Unclear" | null,
+  "interview_platform":       string | null,           // "Teams", "Zoom", "Spark Hire", ...
+  "interview_date_iso":       string | null,           // ISO 8601 if a specific time is given
+  "test_platform":            string | null,           // "Codility", "HackerRank", ...
+  "test_duration_mins":       integer | null,
+  "application_deadline_iso": string | null,           // ISO 8601 if explicitly stated
+  "action_required":          boolean | null,
+  "action_type":              "Respond" | "Click Link" | "Schedule Interview" | "Submit Document"
+                            | "Take Test" | "Do Nothing" | null,
+  "action_deadline_iso":      string | null,           // ISO 8601 by which action_type must be done
+  "work_mode":                "Remote" | "Hybrid" | "On-site" | null,
+  "location":                 string | null,           // e.g. "Cape Town, ZA"
+  "recruiter_name":           string | null,
+  "recruiter_email":          string | null,           // only if explicitly stated in the body
+  "summary":                  string | null            // <=25 words: what was said + what to do next
+}
+
+Return only the JSON object."""
+
+
+@app.timer_trigger(schedule="0 0 0 * * *", arg_name="myTimer", run_on_startup=True, use_monitor=False)
+def analyze_emails_daily(myTimer: func.TimerRequest) -> None:
+    logging.info('Python timer trigger function started analyzing emails via Foundry LLM.')
+
+    conn_str = os.environ["deepstatedatabase_STORAGE"]
+    azure_oai_key = os.environ["AZURE_OPENAI_API_KEY"]
+    endpoint = os.environ["COSMOS_ENDPOINT"]
+    deployment_name = "o4-mini-1"
+
+    client = OpenAI(
+        base_url=endpoint,
+        api_key=azure_oai_key,
+        default_headers={"api-key": azure_oai_key}
+    )
+
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+        container_client = blob_service_client.get_container_client("cleanmail")
+
+        blobs = container_client.list_blobs(name_starts_with="unprocessed/")
+
+        attempted_count = 0
+        for blob in blobs:
+            if attempted_count >= LLM_BATCH_CAP:
+                logging.info(f"Reached maximum batch size of {LLM_BATCH_CAP}. Stopping for this run.")
+                break
+
+            if blob.name.endswith('/'):
+                continue
+
+            attempted_count += 1
+            logging.info(f"Analyzing blob: {blob.name}")
+            blob_client = container_client.get_blob_client(blob)
+
+            try:
+                contents = blob_client.download_blob().readall().decode('utf-8', errors='ignore')
+                email_data = json.loads(contents)
+
+                subject = email_data.get('subject', '')
+                body = email_data.get('body', '')
+
+                user_prompt = f"Email Subject: {subject}\n\nEmail Body: {body}"
+
+                # Exponential backoff for rate limits
+                max_retries = 5
+                response = None
+                for attempt in range(max_retries):
+                    try:
+                        response = client.chat.completions.create(
+                            model=deployment_name,
+                            messages=[
+                                {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            response_format={"type": "json_object"}
+                        )
+                        break
+                    except openai.RateLimitError:
+                        if attempt == max_retries - 1:
+                            raise
+                        sleep_time = (2 ** attempt) + 1
+                        logging.warning(f"Azure OpenAI Rate Limit Hit! Sleeping for {sleep_time}s...")
+                        time.sleep(sleep_time)
+                    except openai.BadRequestError as e:
+                        # Azure content filter (400). The blob will never pass — quarantine it
+                        # immediately rather than leaving it in unprocessed/ to retry forever.
+                        err_code = getattr(e, 'code', '') or ''
+                        if 'content_filter' in str(err_code).lower() or 'content_filter' in str(e).lower():
+                            logging.warning(f"Content filter blocked {blob.name} — moving to quarantine/")
+                            original_filename = blob.name.split('/')[-1]
+                            email_data['analysis'] = {
+                                "error": "content_filter",
+                                "category": "Not Job Related",
+                                "is_automated": True,
+                                "summary": "Blocked by Azure content filter — not analysed."
+                            }
+                            q_client = container_client.get_blob_client(f"quarantine/{original_filename}")
+                            q_client.upload_blob(json.dumps(email_data, indent=4), overwrite=True)
+                            try:
+                                blob_client.delete_blob()
+                            except ResourceNotFoundError:
+                                pass  # already removed by a concurrent run — fine
+                            response = None  # signal to skip normal processing below
+                            break
+                        raise  # non-filter 400 — surface it
+
+                if response is None:
+                    # Blob was quarantined above — skip to next blob
+                    continue
+
+                # Baseline throttle
+                time.sleep(0.5)
+
+                analysis_result = json.loads(response.choices[0].message.content)
+                email_data['analysis'] = analysis_result
+
+                original_filename = blob.name.split('/')[-1]
+                output_blob_name = f"processed/{original_filename}"
+
+                output_blob_client = container_client.get_blob_client(output_blob_name)
+                output_blob_client.upload_blob(json.dumps(email_data, indent=4), overwrite=True)
+
+                # Bug fix: concurrent timer runs can process the same blob simultaneously.
+                # The upload above uses overwrite=True so the last writer wins — data is safe.
+                # If the blob is already gone (deleted by another instance), treat as success.
+                try:
+                    blob_client.delete_blob()
+                except ResourceNotFoundError:
+                    logging.info(f"Blob {blob.name} already deleted by concurrent run — skipping delete.")
+
+            except Exception as inner_e:
+                logging.error(f"Error analyzing blob {blob.name}: {inner_e}")
+                continue
+
+        logging.info(f"Analysis trigger successfully finished. Attempted {attempted_count} emails.")
+
+    except Exception as e:
+        logging.error(f"Fatal error during analysis job: {e}")
+
