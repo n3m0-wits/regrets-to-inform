@@ -11,13 +11,13 @@ A serverless, end-to-end data pipeline that ingests job-application emails and L
 | Layer | Technologies |
 |---|---|
 | Language | Python 3 |
-| Data Processing | Pandas, NumPy, RapidFuzz |
+| Data Processing | Pandas, Polars, SQL, Ibis, NumPy, RapidFuzz |
 | Visualisation | Seaborn, Matplotlib, Power BI *(experimental)* |
 | Cloud Compute | Azure Functions (serverless) + Logic Apps |
 | Cloud Storage | Azure Blob Storage (ADLS Gen2) |
-| Database | Azure CosmosDB |
+| Database | Azure CosmosDB (Depreciated due to Azure Credit Balance) |
 | AI / LLM | OpenAI / Azure OpenAI (Microsoft Foundry) |
-| Parsing | BeautifulSoup4, Python `email` stdlib |
+| Parsing | BeautifulSoup4, Python `email` stdlib, perl |
 
 ---
 
