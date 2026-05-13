@@ -1,5 +1,5 @@
 import os
-from function_app import (
+from Deprecated_Azure_Pipeline.function_app import (
     ADLSManager, CosmosManager, SyncOrchestrator, JobMatcher,
     ADLS_ACCOUNT, ADLS_KEY, COSMOS_ENDPOINT, COSMOS_KEY,
     COSMOS_DB, COSMOS_CONTAINER, EMAIL_DIR, LINKEDIN_PATH
